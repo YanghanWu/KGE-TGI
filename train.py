@@ -1,0 +1,720 @@
+from itertools import accumulate
+from re import I
+import time, random, math, sys
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+#from sklearn.metrics.classification import precision_score
+import torch as torch
+import torch.nn.functional as F
+import dgl
+#import dgl.function as FN
+from sklearn.model_selection import KFold
+from sklearn import metrics
+from scipy import interp
+from utils import build_hetero_graph, sample, construct_negative_graph, set_random_seed, build_graph_for_classify
+from model import GraphTGI_hetero, HeteroDotProductPredictor, GraphTGI_classifier, CNN_Classifier, Linear_Classifier
+
+#torch.set_printoptions(profile='full')
+torch.set_printoptions(profile='default')
+
+def Train_loop(epochs, hidden_size, dropout, slope, lr, wd, random_seed, device):
+    #dgl.load_backend('pytorch')
+    #dgl.backend.load_backend('pytorch')
+    set_random_seed(random_seed)
+
+    activate_samples, repress_samples, unknown_samples, TF_associate_disease_samples, tg_associate_disease_samples, go_associate_TF_samples, TF_coregulate_TF_samoles = sample()
+
+    # four Kfold to seperate activation data, repression data, TF_associate_disease data and tg_associate_disease data respectivly. 
+    kf = KFold(n_splits=5, shuffle=True, random_state=random_seed)
+
+    activate_train_index = []
+    activate_test_index = []
+    repress_train_index = []
+    repress_test_index = []
+    unknown_train_index = []
+    unknown_test_index = []
+
+    TF_disease_train_index = []
+    TF_disease_test_index = []
+    tg_disease_train_index = []
+    tg_disease_test_index = []
+    
+    go_TF_train_index = []
+    go_TF_test_index = []
+    
+    for train_idx, test_idx in kf.split(activate_samples):
+        activate_train_index.append(train_idx)
+        activate_test_index.append(test_idx)
+    
+    for train_idx, test_idx in kf.split(repress_samples):
+        repress_train_index.append(train_idx)
+        repress_test_index.append(test_idx)
+
+    for train_idx , test_idx in kf.split(unknown_samples):
+        unknown_train_index.append(train_idx)
+        unknown_test_index.append(test_idx)
+
+    for train_idx, test_idx in kf.split(TF_associate_disease_samples):
+        TF_disease_train_index.append(train_idx)
+        TF_disease_test_index.append(test_idx)
+    
+    for train_idx, test_idx in kf.split(tg_associate_disease_samples):
+        tg_disease_train_index.append(train_idx)
+        tg_disease_test_index.append(test_idx)
+    
+    for train_idx, test_idx in kf.split(go_associate_TF_samples):
+        go_TF_train_index.append(train_idx)
+        go_TF_test_index.append(test_idx)
+    
+   
+    lp_auc_result = []
+    lp_acc_result = []
+    lp_pre_result = []
+    lp_recall_result = []
+    lp_f1_result = []
+    
+    lp_fprs = []
+    lp_tprs = []
+
+    c_auc_result = []
+    c_acc_result = []
+    c_pre_result = []
+    c_recall_result = []
+    c_f1_result = []
+    c_hamming_loss_result = []
+
+
+    c_fprs = []
+    c_tprs = []
+    
+    my_threshold = 0.5
+
+    
+    # generate a new graph for training in each fold
+    # generate the negative graph in each epoch
+    for i_fold in range(len(activate_train_index)):
+        
+        print('=====================Training for fold', i_fold + 1, '==============================')
+
+        train_graph, io_feats = build_hetero_graph(activate_train_index[i_fold], repress_train_index[i_fold], unknown_train_index[i_fold], TF_disease_train_index[i_fold], tg_disease_train_index[i_fold], go_TF_train_index[i_fold],random_seed, device)
+        test_graph, test_io_feats = build_hetero_graph(activate_test_index[i_fold], repress_test_index[i_fold], unknown_test_index[i_fold],TF_disease_test_index[i_fold], tg_disease_test_index[i_fold], go_TF_test_index[i_fold], random_seed, device)
+        # reorder_graph()
+        
+        #train_graph = train_graph.to(device)
+        #test_graph = test_graph.to(device)
+        
+        # 边分类和链接预测是类似的,可以使用同一个模型进行推导
+        # 链接预测需要针对要预测的类型生成一个negative graph，在每个epoch中生成不一样的activate/repress negative graph
+        # 边分类需要隐藏边的类型信息，要先把异构图转为只含一种边的图
+        
+
+        # encoder
+        model_encoder = GraphTGI_hetero(io_feats, hidden_size, slope)
+        model_encoder = model_encoder.to(device)
+        
+        # init parameters
+        # Double layers (include 0) are bias layer and does not need to be initialized 
+        model_parameters = list(model_encoder.parameters())
+
+        for j in range(1,len(model_parameters)):
+            if(j%2 == 2):
+                parameters = model_parameters[j]
+                torch.nn.init.xavier_normal_(parameters, gain = torch.nn.init.calculate_gain('relu'))
+
+        cross_entropy = torch.nn.CrossEntropyLoss()
+        BCEloss = torch.nn.BCELoss()
+        MultiLabelCE = torch.nn.MultiLabelSoftMarginLoss()
+
+        # predictor
+        linkPredictor = HeteroDotProductPredictor()
+        linkPredictor = linkPredictor.to(device)
+        
+        # classifier
+        # using the feature that generated by the model_encoder, so the in_feat_dim = 256
+        model_classifier = GraphTGI_classifier(247, 128, slope)
+        #model_classifier = CNN_Classifier(slope)
+        #model_classifier = Linear_Classifier(slope)
+
+        model_classifier = model_classifier.to(device)
+
+        opt = torch.optim.Adam([
+            {'params': model_encoder.parameters(), 'lr': lr},
+            {'params': model_classifier.parameters(), 'lr': lr}
+            ])
+        
+        # parameters for gradnorm
+        L0_1 = None
+        L0_2 = None
+        #w1 = torch.FloatTensor([1]).reguires_grad_(True)
+        #w2 = torch.FloatTensor([1]).reguires_grad_(True)
+        w1 = torch.tensor(torch.FloatTensor([1]), requires_grad=True, device = device)
+        w2 = torch.tensor(torch.FloatTensor([1]), requires_grad=True, device = device)
+        weight_params = [w1, w2]
+        
+        opt2 = torch.optim.Adam(weight_params, lr=lr)
+
+        
+        # train node features
+        train_TF_feats = train_graph.nodes['TF'].data['feature']
+        train_tg_feats = train_graph.nodes['tg'].data['feature']
+        train_disease_feats = train_graph.nodes['disease'].data['feature']
+        train_go_feats = train_graph.nodes['go'].data['feature']
+        train_node_features = {'TF': train_TF_feats, 'tg': train_tg_feats, 'disease': train_disease_feats, 'go' : train_go_feats} 
+        #train_node_features = {'TF': train_TF_feats, 'tg': train_tg_feats, 'disease': train_disease_feats} 
+        #train_node_features = {'TF': train_TF_feats, 'tg': train_tg_feats,'go' : train_go_feats}   
+        #train_node_features = {'TF': train_TF_feats, 'tg': train_tg_feats,}        
+        
+        # test node features
+        test_TF_feats = test_graph.nodes['TF'].data['feature']
+        test_tg_feats = test_graph.nodes['tg'].data['feature']
+        test_disease_feats = test_graph.nodes['disease'].data['feature']
+        test_go_feats = test_graph.nodes['go'].data['feature']
+        test_node_features = {'TF': test_TF_feats, 'tg': test_tg_feats, 'disease': test_disease_feats, 'go':test_go_feats}
+        #test_node_features = {'TF': test_TF_feats, 'tg': test_tg_feats, 'disease': test_disease_feats}
+        #test_node_features = {'TF': test_TF_feats, 'tg': test_tg_feats, 'go':test_go_feats}
+        #test_node_features = {'TF': test_TF_feats, 'tg': test_tg_feats}
+
+        '''
+        task_loss_1_record = []
+        task_loss_2_record = []
+        o_task_loss_1_record = []
+        o_task_loss_2_record = []
+        
+        total_loss_record = []
+        o_total_loss_record = []
+        weight_params_1_record = []
+        weight_params_2_record = []'''
+        
+        #torch.autograd.set_detect_anomaly(True)
+        
+        for epoch in range(epochs):
+            start = time.time()
+
+            # train
+            for _ in range(10):
+                train_lp_loss, train_c_loss, train_total_loss, embedding = train(train_graph, train_node_features, model_encoder, linkPredictor, model_classifier, BCEloss, MultiLabelCE, opt, opt2, weight_params, L0_1, L0_2, device)
+                
+            # test
+            test_lp_loss, test_c_loss, test_total_loss, test_lp_scores, test_lp_labels, test_c_score, test_c_label = test(test_graph, test_node_features, model_encoder, linkPredictor, model_classifier, BCEloss, MultiLabelCE, weight_params, device, i_fold)
+            
+            '''test_lp_loss = test_lp_loss.detach().numpy()
+            test_c_loss = test_c_loss.detach().numpy()
+            test_total_loss = test_total_loss.detach().numpy()
+
+            weight_params_1_record.append(weight_params[0].detach().numpy())
+            weight_params_2_record.append(weight_params[1].detach().numpy())
+
+            o_task_loss_1_record.append(test_lp_loss)
+            o_task_loss_2_record.append(test_c_loss)
+
+            task_loss_1_record.append(weight_params[0].detach().numpy() * test_lp_loss)
+            task_loss_2_record.append(weight_params[1].detach().numpy() * test_c_loss)
+
+            total_loss_record.append(test_total_loss)
+            o_total_loss_record.append(test_lp_loss + test_c_loss)'''
+
+
+            # metrics for link prediction
+            # only measure the regulate type 
+            test_lp_label = test_lp_labels['regulate']
+            test_lp_score = test_lp_scores['regulate']
+            
+            lp_val_label = test_lp_label.cpu().numpy()
+            lp_val_score = test_lp_score.cpu().numpy()
+
+            lp_val_auc = metrics.roc_auc_score(lp_val_label, lp_val_score)
+
+            lp_val_score = np.where(lp_val_score > my_threshold, 1, 0)
+            lp_accuracy_val = metrics.accuracy_score(lp_val_label, lp_val_score)
+            lp_precision_val = metrics.precision_score(lp_val_label, lp_val_score)
+            lp_recall_val = metrics.recall_score(lp_val_label, lp_val_score)
+            lp_f1_val = metrics.f1_score(lp_val_label, lp_val_score)
+
+            # metrics for classfication
+            c_val_label = test_c_label.cpu().numpy()
+            c_val_score = test_c_score.cpu().numpy()
+
+            #c_val_auc = metrics.roc_auc_score(c_val_label[0:int((len(c_val_label)+1)/2)], c_val_score[0:int((len(c_val_label)+1)/2)])
+            c_val_auc = metrics.roc_auc_score(c_val_label, c_val_score, average = 'weighted')
+            c_val_score = np.where(c_val_score > 0.5, 1, 0)
+
+            #c_accuracy_val = metrics.accuracy_score(c_val_label, c_val_score)
+            c_precision_val = metrics.precision_score(c_val_label, c_val_score, average='samples')
+            c_recall_val = metrics.recall_score(c_val_label, c_val_score, average='samples')
+            c_f1_val = metrics.f1_score(c_val_label, c_val_score, average='samples')
+            c_hamming_loss_val = metrics.hamming_loss(c_val_label, c_val_score)
+            
+            end = time.time()
+            print('Epoch:', epoch + 1, 
+                  'Train lp Loss: %.4f' % train_lp_loss, 'Train c Loss: %.4f' % train_c_loss,'Train Loss: %.4f' % train_total_loss, 
+                  'test lp Loss: %.4f' % test_lp_loss, 'Test c Loss: %.4f' % test_c_loss,'Test Loss: %.4f' % test_total_loss)
+                
+            print('LP Acc: %.4f' % lp_accuracy_val, 'LP Pre: %.4f' % lp_precision_val, 
+                  'LP Recall: %.4f' % lp_recall_val, 'LP F1: %.4f' % lp_f1_val, 'LP AUC: %.4f' % lp_val_auc,
+                  'C hamming loss: %.4f' % c_hamming_loss_val, 'C Pre: %.4f' % c_precision_val, 
+                  'C Recall: %.4f' % c_recall_val, 'C F1: %.4f' % c_f1_val, 'C auc: %.4f' % c_val_auc,
+                  'Time: %.2f' % (end - start))
+
+
+        '''# embedding 
+        TF_embedding = embedding['TF'].detach().numpy()
+        tg_embedding = embedding['tg'].detach().numpy()
+        
+
+        TF_embedding_pd = pd.DataFrame(TF_embedding)
+        tg_embedding_pd = pd.DataFrame(tg_embedding)
+        TF_embedding_pd.to_csv('./data/result/TF_embedding_2.csv')
+        tg_embedding_pd.to_csv('./data/result/tg_embedding_2.csv')'''
+        
+
+
+        '''
+        # draw loss curve
+        x_axis = range(len(task_loss_1_record))
+        
+        plt.plot(x_axis, task_loss_1_record, color='blue', alpha=0.8, label='loss of link prediction task')
+        plt.plot(x_axis, task_loss_2_record, color='yellow', alpha=0.8, label='loss of classification task')
+        #plt.plot(x_axis, o_task_loss_1_record, color='blue',  ls = '-.', alpha=0.8, label='origin loss of link prediction task')
+        #plt.plot(x_axis, o_task_loss_2_record, color='yellow', ls = '-.', alpha=0.8, label='origin loss of classification task')
+        #plt.plot(x_axis, o_total_loss_record, color='red', ls = '-.', alpha=0.8, label='origin total loss')
+        plt.plot(x_axis, total_loss_record, color='red', alpha=0.8, label='total loss')
+        
+        plt.xlabel('epoch')
+        #plt.ylabel('loss')
+        plt.title('Loss curves with GradNorm')
+        plt.legend(loc='upper right')
+        plt.show()
+
+
+        x_axis = range(len(task_loss_1_record))
+        
+        plt.plot(x_axis, task_loss_1_record, color='blue', alpha=0.8, label='loss of link prediction task')
+        plt.plot(x_axis, task_loss_2_record, color='yellow', alpha=0.8, label='loss of classification task')
+        plt.plot(x_axis, o_task_loss_1_record, color='blue',  ls = '-.', alpha=0.8, label='origin loss of link prediction task')
+        plt.plot(x_axis, o_task_loss_2_record, color='yellow', ls = '-.', alpha=0.8, label='origin loss of classification task')
+        plt.plot(x_axis, o_total_loss_record, color='red', ls = '-.', alpha=0.8, label='origin total loss')
+        plt.plot(x_axis, total_loss_record, color='red', alpha=0.8, label='total loss')
+        
+        plt.xlabel('epoch')
+        #plt.ylabel('loss')
+        plt.title('Loss curves with GradNorm')
+        plt.legend(loc='upper right')
+        plt.show()
+
+        plt.plot(x_axis, weight_params_1_record, color='blue', alpha=0.8, label='loss weight of link prediction task')
+        plt.plot(x_axis, weight_params_2_record, color='yellow', alpha=0.8, label='loss weight of classification task')
+        
+        plt.xlabel('epoch')
+        #plt.ylabel('loss')
+        plt.title('Weight curves with GradNorm')
+        plt.legend(loc='upper right')
+        plt.show()'''
+        
+
+        lp_loss, c_loss, total_loss, lp_scores, lp_labels, c_score, c_label = test(test_graph, test_node_features, model_encoder, linkPredictor, model_classifier, BCEloss, MultiLabelCE, weight_params, device, i_fold)
+        
+
+
+        # link prediction
+        lp_label = lp_labels['regulate']
+        lp_score = lp_scores['regulate']
+        
+        
+        lp_label = lp_label.cpu().numpy()
+        lp_score = lp_score.cpu().numpy()
+        
+        # 作图要用每个点的概率，不要分成0或1的类别
+        lp_fpr, lp_tpr, thresholds = metrics.roc_curve(lp_label, lp_score)
+        lp_auc = metrics.auc(lp_fpr, lp_tpr)
+
+        '''lp_pd = pd.DataFrame(lp_score[0:int(len(lp_score)/2)],columns=['pos_score'])
+        lp_pd['neg_score'] = lp_score[int(len(lp_score)/2):len(lp_score)]
+        lp_pd['pos_label'] = lp_label[0:int(len(lp_score)/2)]
+        lp_pd['neg_label'] = lp_label[int(len(lp_score)/2):len(lp_score)]
+        lp_pd.to_csv('./data/result/test'+ str(i+1) +'.csv')'''
+
+        lp_score = np.where(lp_score > my_threshold, 1, 0)
+        
+        # comfusion_matrix = metrics.confusion_matrix(label.numpy(), score.numpy())
+            
+        lp_accuracy = metrics.accuracy_score(lp_label, lp_score)
+        lp_precision = metrics.precision_score(lp_label, lp_score)
+        lp_recall = metrics.recall_score(lp_label, lp_score)
+        lp_f1 = metrics.f1_score(lp_label,lp_score)
+
+       
+        lp_auc_result.append(lp_auc)
+        lp_acc_result.append(lp_accuracy)
+        lp_pre_result.append(lp_precision)
+        lp_recall_result.append(lp_recall)
+        lp_f1_result.append(lp_f1)
+
+        lp_fprs.append(lp_fpr)
+        lp_tprs.append(lp_tpr)
+
+        # classification
+        
+        c_label = c_label.cpu().numpy()
+        c_score = c_score.cpu().numpy()
+        
+      
+        # 作图要用每个点的概率，不要分成0或1的类别
+        
+        n_classes = 2
+        fpr = dict()
+        tpr = dict()
+        roc_auc = dict()
+        for idx_class in range(n_classes):
+            fpr[idx_class], tpr[idx_class], _ = metrics.roc_curve(c_label[:, idx_class], c_score[:, idx_class])
+            roc_auc[idx_class] = metrics.auc(fpr[idx_class], tpr[idx_class])
+
+        # Compute macro-average ROC curve and ROC area（方法一）
+        # First aggregate all false positive rates
+        all_fpr = np.unique(np.concatenate([fpr[i] for i in range(n_classes)]))
+
+        # Then interpolate all ROC curves at this points
+        mean_tpr = np.zeros_like(all_fpr)
+        for idx_class in range(n_classes):
+            mean_tpr += interp(all_fpr, fpr[idx_class], tpr[idx_class])
+
+        # Finally average it and compute AUC
+        mean_tpr /= n_classes
+        fpr["macro"] = all_fpr
+        tpr["macro"] = mean_tpr
+        roc_auc["macro"] = metrics.auc(fpr["macro"], tpr["macro"])
+        c_auc = roc_auc['macro']
+
+        '''c_fpr_1, c_tpr_1, thresholds_1 = metrics.roc_curve(c_label[0], c_score[0])
+        c_fpr_2, c_tpr_2, thresholds_2 = metrics.roc_curve(c_label[1], c_score[1])
+
+        c_auc_1 = metrics.auc(c_fpr_1, c_tpr_1)
+        c_auc_2 = metrics.auc(c_fpr_2, c_tpr_2)
+        c_auc = (c_auc_1 + c_auc_2)/2'''
+
+        c_score = np.where(c_score > 0.5, 1, 0)
+            
+        #c_accuracy = metrics.accuracy_score(c_label, c_score, average='samples')
+        c_precision = metrics.precision_score(c_label, c_score, average='samples')
+        c_recall = metrics.recall_score(c_label, c_score, average='samples')
+        c_f1 = metrics.f1_score(c_label,c_score, average='samples')
+        c_hamming_loss = metrics.hamming_loss(c_label, c_score)
+
+        c_auc_result.append(c_auc)
+        #c_acc_result.append(c_accuracy)
+        c_pre_result.append(c_precision)
+        c_recall_result.append(c_recall)
+        c_f1_result.append(c_f1)
+        c_hamming_loss_result.append(c_hamming_loss)
+
+        c_fprs.append(fpr["macro"])
+        c_tprs.append(tpr["macro"])   
+        
+
+        print('Fold:', i_fold + 1, 'Test LP Acc: %.4f' % lp_accuracy, 'Test LP Pre: %.4f' %lp_precision,
+              'Test LP Recall: %.4f' % lp_recall, 'Test LP F1: %.4f' % lp_f1, 'Test LP AUC: %.4f' % lp_auc,
+              'Test C Hamming loss: %.4f' % c_hamming_loss, 'Test C Pre: %.4f' % c_precision,
+              'Test C Recall: %.4f' % c_recall, 'Test C F1: %.4f' % c_f1, 'Test C auc: %.4f' % c_auc,)
+        
+    print('w1,w2', weight_params[0], weight_params[1])
+    print('training finished')
+    print('parameter  ', 'lr:', lr, 'layer:3', 'gradnorm layer: 6', 'G+T self loop, 1024-512-256')
+
+    return lp_auc_result, lp_acc_result, lp_pre_result, lp_recall_result, lp_f1_result, lp_fprs, lp_tprs, c_auc_result, c_hamming_loss_result, c_pre_result, c_recall_result, c_f1_result, c_fprs, c_tprs
+
+
+def train(train_graph, node_features, model_encoder, linkPredictor, model_classifier, BCEloss, MultiLabelCE, opt, opt2, weight_params, L0_1, L0_2, device):
+    
+    model_encoder.train()
+    model_classifier.train()
+
+    # generate dec_graph for 3 kinds edge which need to be classifed.
+    # 异构图进行边分类时不能带有边的信息, 需要把异构图转为只含一种(未知)边的图
+    # 由于每次的negative edge是重新生成的，所以dec_graph也要重新生成
+    # 原图中的边类型会被转为边特征 dgl.ETYPE, 转为数值标签，以便后续使用
+    # 预测边是 activate/repress/associate_1/associate_2/negative 的哪一类
+    # sub_train_graph是只包含五种待预测边类型的子图
+
+    # encode to generate embeddings
+    graph = model_encoder(train_graph, node_features)
+    
+    embedding = graph.ndata['h']
+    
+
+    # 输出图所有的边类型，返回的是一个list
+    etypes = train_graph.canonical_etypes
+    
+  
+    link_prediction_scores = {}
+    link_prediction_labels = {}
+   
+    lp_score = []
+    # link prediction 
+    for etype in etypes:
+
+        u,e,d = etype
+        
+        # extract sub_graph
+        sub_train_graph = train_graph.edge_type_subgraph([etype])
+        # build negative graph
+        train_negative_graph = construct_negative_graph(sub_train_graph, 1, etype, device)
+
+        label = sub_train_graph.edges[etype].data['lp_label'].to(torch.int64)
+        
+        # extract feature of dec_graph 
+        
+        # origin
+        node_types = sub_train_graph.ntypes
+        dec_h = {node_types[j]: graph.nodes[node_types[j]].data['h'] for j in range(len(node_types))}
+        
+
+        '''
+        # 有待改进
+        node_types = sub_train_graph.ntypes
+        dec_a_h = {node_types[j]: sub_train_graph.nodes[node_types[j]].data['h'] for j in range(len(node_types))}
+
+        neg_node_types = train_negative_graph.ntypes
+        dec_n_h = {neg_node_types[j]: graph.nodes[neg_node_types[j]].data['h'] for j in range(len(neg_node_types))}
+        '''
+        
+        # if the sub_graph only contain one type of node
+        # should pass the feature tensor of node into the model directly 
+        if u == d:
+            dec_h = dec_h[u] 
+
+        # link prediction using dot product
+        pos_link_prediction_score = linkPredictor(sub_train_graph, dec_h, etype)
+        neg_link_prediction_score = linkPredictor(train_negative_graph, dec_h, etype)
+
+        # generate label
+        pos_link_prediction_label = torch.ones([len(label),1], dtype = torch.float32).to(device)
+        neg_link_prediction_label = torch.zeros([len(label),1], dtype = torch.float32).to(device)
+        
+        link_prediction_score = torch.cat((pos_link_prediction_score, neg_link_prediction_score), 0)
+        link_prediction_label = torch.cat((pos_link_prediction_label, neg_link_prediction_label), 0)
+
+        link_prediction_scores[e] = link_prediction_score
+        link_prediction_labels[e] = link_prediction_label
+
+    # compute loss for link-prediction task
+    # the goal of model is to predict links of 'regulate' etype precisely
+    # so that the others link are weighted to 0.1
+    lp_loss = 0
+    for etype in etypes:
+        u,e,d = etype
+        if e != 'regulate':
+            lp_loss +=  0.5 * BCEloss(link_prediction_scores[e], link_prediction_labels[e])
+        else:
+            lp_loss +=  BCEloss(link_prediction_scores[e], link_prediction_labels[e])
+
+    # classification
+    # using the embedding feature generated by the model_encoder as node features
+    lp_score = link_prediction_scores['regulate']   # only 'regulate' etype
+    lp_score = torch.where(lp_score > 0.5, 1, 0)
+
+    sub_graph = graph.edge_type_subgraph([('TF','regulate','tg')])
+    
+    c_graph, c_h, c_label = build_graph_for_classify(sub_graph, lp_score, device)
+    
+    # classifier
+    c_score = model_classifier(c_graph, c_h)
+    
+    c_loss = MultiLabelCE(c_score,c_label)
+ 
+    
+    # GradNorm 
+    Gradloss = torch.nn.L1Loss()
+    
+    w_1 = weight_params[0]
+    w_2 = weight_params[1]
+    
+    if(L0_1 == None):
+        L0_1 = lp_loss
+        L0_2 = c_loss
+       
+    task_loss_1 = weight_params[0] * lp_loss
+    task_loss_2 = weight_params[1] * c_loss
+    #loss = torch.div(torch.add(task_loss_1, task_loss_2), 2)
+    loss = torch.add(task_loss_1, task_loss_2)
+    
+    opt.zero_grad()
+    loss.backward(retain_graph=True)
+
+    model_params = list(model_encoder.parameters())
+    
+    # 模型由三层GCNs组成
+    # 每个GCNs层都包含四个GCN层
+    # 每个GCN层包含一个W矩阵和一个bias矩阵
+    # 3*4*2 = 24层
+    # 以最后一层的参数作为更新的依据
+
+    
+    Gwt_1 = torch.autograd.grad(task_loss_1, model_params[6], retain_graph=True, create_graph=True, allow_unused=True)
+    
+    
+    #for i in range(len(Gwt_1)):
+    #    if Gwt_1[i] != None: 
+    #        print(i)
+    #        #G_1 = torch.norm(Gwt_1[i], 2)
+    #        #break
+    #input()
+    
+    G_1 = torch.norm(Gwt_1[0], 2)
+    Gwt_2 = torch.autograd.grad(task_loss_2, model_params[6], retain_graph=True, create_graph=True, allow_unused=True)
+    
+    #for i in range(len(Gwt_2)):
+    #    if Gwt_2[i] != None: 
+    #        print(i)
+    #        G_2 = torch.norm(Gwt_2[i], 2)
+    #        break
+    
+    G_2 = torch.norm(Gwt_2[0], 2)
+
+    Gwt_avg = torch.div(torch.add(G_1, G_2), 2)
+        
+    # Calculating relative losses 
+    L_hat1 = torch.div(lp_loss, L0_1)
+    L_hat2 = torch.div(c_loss, L0_2)
+    L_hat_avg = torch.div(torch.add(L_hat1, L_hat2), 2)
+    
+    # Calculating relative inverse training rates for tasks 
+    inv_rate1 = torch.div(L_hat1, L_hat_avg)
+    inv_rate2 = torch.div(L_hat2, L_hat_avg)
+    
+    # Calculating the constant target for Eq. 2 in the GradNorm paper
+    C1 = Gwt_avg*(inv_rate1)**1.5
+    C2 = Gwt_avg*(inv_rate2)**1.5
+    C1 = C1.detach()
+    C2 = C2.detach()
+    
+    opt2.zero_grad()
+
+    # Calculating the gradient loss according to Eq. 2 in the GradNorm paper
+    L_grad = torch.add(Gradloss(G_1, C1), Gradloss(G_2, C2))
+    L_grad.backward(retain_graph=True)
+        
+    # Updating loss weights 
+    opt2.step()
+    
+    # Updating the model weights
+    opt.step()
+    
+    # Renormalizing the losses weights
+    # T = 2
+    coef = 2 / torch.add(w_1, w_2)
+    
+    weight_params = [coef * w_1,  coef * w_2]
+    
+
+    
+    '''# do not use GradNorm
+    loss = lp_loss + c_loss
+
+    opt.zero_grad()
+    loss.backward()
+    opt.step()'''
+    
+    
+    #return lp_loss, c_loss, lp_loss + c_loss
+    return lp_loss*weight_params[0], c_loss*weight_params[1], lp_loss*weight_params[0] + c_loss*weight_params[1], embedding
+
+def test(test_graph, test_node_features, model_encoder, linkPredictor, model_classifier, BCEloss, MultiLabelCE, weight_params, device, flag):
+    
+    model_encoder.eval()
+    model_classifier.eval()
+    
+   
+    with torch.no_grad():
+        
+
+        # encode to generate embeddings
+        graph = model_encoder(test_graph, test_node_features)
+
+        '''if flag == 4:
+            embedding = graph.ndata['h']
+            TF_embedding = embedding['TF']
+            tg_embedding = embedding['tg']
+
+            TF_embedding = TF_embedding.numpy()
+            tg_embedding = tg_embedding.numpy()
+
+            TF_embedding_pd = pd.DataFrame(TF_embedding)
+            tg_embedding_pd = pd.DataFrame(tg_embedding)
+
+            TF_embedding_pd.to_csv('./data/result/TF_embedding.csv')
+            tg_embedding_pd.to_csv('./data/result/tg_embedding.csv')'''
+
+
+
+        etypes = test_graph.canonical_etypes
+       
+        test_lp_labels = {}
+        test_lp_scores = {}
+    
+        for etype in etypes:
+            u,e,d = etype
+
+            sub_test_graph = test_graph.edge_type_subgraph([etype])
+            test_negative_graph = construct_negative_graph(sub_test_graph, 1, etype, device)
+
+            label = sub_test_graph.edges[etype].data['lp_label'].to(torch.int64)
+
+            # extract feature of dec_graph 
+            node_types = sub_test_graph.ntypes
+            dec_h = {node_types[j]: graph.nodes[node_types[j]].data['h'] for j in range(len(node_types))}
+
+            # if the sub graph only have one type of node, pass tensor directly
+            if u == d:
+                dec_h = dec_h[u]
+            
+            # link prediction using dot product
+            pos_link_prediction_score = linkPredictor(sub_test_graph, dec_h, etype)
+            neg_link_prediction_score = linkPredictor(test_negative_graph, dec_h, etype)
+
+            # label
+            pos_link_prediction_label = torch.ones([len(label), 1], dtype = torch.float32).to(device)
+            neg_link_prediction_label = torch.zeros([len(label), 1], dtype = torch.float32).to(device)
+
+            link_prediction_score = torch.cat((pos_link_prediction_score, neg_link_prediction_score), 0)
+            link_prediction_label = torch.cat((pos_link_prediction_label, neg_link_prediction_label), 0)
+
+            # note that which label/score been added
+            
+            test_lp_scores[e] = link_prediction_score
+            test_lp_labels[e] = link_prediction_label
+ 
+        # compute loss for link-prediction task
+        
+        test_lp_loss = 0
+        for etype in etypes:
+            u,e,d = etype
+            if etype != ('TF','regulate','tg'):
+                test_lp_loss +=  0.5 * BCEloss(test_lp_scores[e], test_lp_labels[e])
+            else:
+                test_lp_loss +=  BCEloss(test_lp_scores[e], test_lp_labels[e])
+
+        # classification
+        # using the embedding feature generated by the model_encoder as node features
+        lp_score = test_lp_scores['regulate']   # only 'regulate' etype
+        lp_score = torch.where(lp_score > 0.5, 1, 0)
+        
+        sub_graph = graph.edge_type_subgraph([('TF','regulate','tg')])
+        
+        c_graph, c_h, test_c_label = build_graph_for_classify(sub_graph, lp_score, device)
+        
+        test_c_score = model_classifier(c_graph, c_h)
+        test_c_loss = MultiLabelCE(test_c_score, test_c_label)
+
+        #test_total_loss =  weight_params[0] * test_lp_loss +  weight_params[1] * test_c_loss 
+        test_total_loss =  test_lp_loss +  test_c_loss 
+
+
+    return  test_lp_loss, test_c_loss, test_total_loss, test_lp_scores, test_lp_labels, test_c_score, test_c_label
+   
+
+
+
+
+
+    
+    
