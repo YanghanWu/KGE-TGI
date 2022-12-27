@@ -1,22 +1,16 @@
 import matplotlib.pyplot as plt
 import numpy as np
-import pandas as pd
-import dgl
 import torch as torch
 from scipy import interp
 from sklearn import metrics
-import warnings,sys
-import networkx as nx
-import prettytable as pt
 from train import Train_loop
 
 
 if __name__ == '__main__':
     #dgl.backend.load_backend('pytorch')
-    warnings.filterwarnings("ignore")
     #dgl.load_backend('pytorch')
+
     device = torch.device("cpu")
-    #device = torch.device("cuda:1")
     
     lp_auc, lp_acc, lp_pre, lp_recall, lp_f1, lp_fprs, lp_tprs, \
     c_auc, c_hamming_loss, c_pre, c_recall, c_f1, c_fprs, c_tprs = Train_loop(epochs=30,
@@ -40,20 +34,6 @@ if __name__ == '__main__':
           'F1-score C mean: %.4f, variance: %.4f \n' % (np.mean(c_f1), np.std(c_f1))
           )
 
-    '''
-    lp_auc_pd = pd.DataFrame(lp_auc)
-    lp_fprs_pd = pd.DataFrame(lp_fprs)
-    lp_tprs_pd = pd.DataFrame(lp_tprs)
-    c_auc_pd = pd.DataFrame(c_auc)
-    c_fprs_pd = pd.DataFrame(c_fprs)
-    c_tprs_pd = pd.DataFrame(c_tprs)
-    
-    lp_auc_pd.to_csv('./data/debug_data/g_lp_auc.csv')
-    lp_fprs_pd.to_csv('./data/debug_data/g_lp_fprs.csv')
-    lp_tprs_pd .to_csv('./data/debug_data/g_lp_tprs.csv')
-    c_auc_pd.to_csv('./data/debug_data/g_c_auc.csv')
-    c_fprs_pd.to_csv('./data/debug_data/g_c_fprs.csv')
-    c_tprs_pd .to_csv('./data/debug_data/g_c_tprs.csv')'''
 
 
     lp_mean_fpr = np.linspace(0, 1, 10000)
