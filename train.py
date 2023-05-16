@@ -3,7 +3,7 @@ import numpy as np
 import torch as torch
 import torch.nn.functional as F
 import dgl
-
+import pandas as pd
 from sklearn.model_selection import KFold
 from sklearn import metrics
 from scipy import interp
@@ -176,7 +176,7 @@ def Train_loop(epochs, hidden_size, dropout, slope, lr, wd, random_seed, device)
 
             # train
             for _ in range(10):
-                train_lp_loss, train_c_loss, train_total_loss = train(
+                train_lp_loss, train_c_loss, train_total_loss, embedding = train(
                     train_graph, 
                     train_node_features, 
                     model_encoder, 
@@ -191,6 +191,17 @@ def Train_loop(epochs, hidden_size, dropout, slope, lr, wd, random_seed, device)
                     L0_2, 
                     device)
                 
+                if epoch == epochs-1 and _ == 9:
+                    TF_embedding = embedding['TF'].detach().numpy()
+                    tg_embedding = embedding['tg'].detach().numpy()
+                    TF_embedding_pd = pd.DataFrame(TF_embedding)
+                    tg_embedding_pd = pd.DataFrame(tg_embedding)
+                    TF_embedding_pd.to_csv('./TF_embedding.csv')
+                    tg_embedding_pd.to_csv('./tg_embedding.csv')
+                    
+                    
+            
+
             # test
             test_lp_loss, test_c_loss, test_total_loss, test_lp_scores, test_lp_labels, test_c_score, test_c_label = test(
                 test_graph, 
@@ -351,6 +362,7 @@ def train(train_graph, node_features, model_encoder, linkPredictor, model_classi
 
     # encode to generate embeddings
     graph = model_encoder(train_graph, node_features)
+    embedding = graph.ndata['h']
 
     etypes = train_graph.canonical_etypes
     
@@ -413,7 +425,8 @@ def train(train_graph, node_features, model_encoder, linkPredictor, model_classi
 
     sub_graph = graph.edge_type_subgraph([('TF','regulate','tg')])
     
-    c_graph, c_h, c_label, unknown_graph, unknown_h = build_graph_for_classify(sub_graph, lp_score, device)
+    #c_graph, c_h, c_label, unknown_graph, unknown_h = build_graph_for_classify(sub_graph, lp_score, device)
+    c_graph, c_h, c_label = build_graph_for_classify(sub_graph, lp_score, device)
     
     # classify
     c_score = model_classifier(c_graph, c_h)
@@ -480,7 +493,7 @@ def train(train_graph, node_features, model_encoder, linkPredictor, model_classi
     
     weight_params = [coef * w_1,  coef * w_2]
     
-    return lp_loss*weight_params[0], c_loss*weight_params[1], lp_loss*weight_params[0] + c_loss*weight_params[1]
+    return lp_loss*weight_params[0], c_loss*weight_params[1], lp_loss*weight_params[0] + c_loss*weight_params[1], embedding
 
 
 
@@ -495,7 +508,7 @@ def test(test_graph, test_node_features, model_encoder, linkPredictor, model_cla
 
         # encode to generate embeddings
         graph = model_encoder(test_graph, test_node_features)
-
+        
 
         etypes = test_graph.canonical_etypes
        

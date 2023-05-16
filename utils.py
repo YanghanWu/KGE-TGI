@@ -19,8 +19,8 @@ def load_feature_data():
 
 def sample():
     
-    activation = pd.read_csv('./data/activation_new.csv',header=0)
-    repression = pd.read_csv('./data/repression_new.csv',header=0)
+    activation = pd.read_csv('./data/activation.csv',header=0)
+    repression = pd.read_csv('./data/repression.csv',header=0)
     unknown = pd.read_csv('./data/unknown.csv',header=0)
     TF_associate_disease = pd.read_csv('./data/TF_disease_num.csv',header=0)  
     tg_associate_disease = pd.read_csv('./data/tg_disease_num.csv',header=0)
